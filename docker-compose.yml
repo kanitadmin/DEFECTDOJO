@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  # 1. ฐานข้อมูล PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: defectdojo_db
+    env_file: .env # อ่านค่าจาก .env
+    environment:
+      # ส่งค่าจาก .env เข้าไปใน container
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - defectdojo-db-data:/var/lib/postgresql/data
+    restart: always
+
+  # 2. Redis (สำหรับ Celery Task Queue)
+  redis:
+    image: redis:7-alpine
+    container_name: defectdojo_redis
+    restart: always
+
+  # 3. Celery Beat (ตัวจัดการ Task ตามกำหนดเวลา)
+  celerybeat:
+    image: defectdojo/defectdojo-django:latest
+    container_name: defectdojo_celerybeat
+    env_file: .env
+    command: >
+      celery -A dojo beat
+        -l info
+        --pidfile /tmp/celerybeat.pid
+        --schedule /tmp/celerybeat-schedule
+    depends_on:
+      - db
+      - redis
+    restart: always
+
+  # 4. Celery Worker (ตัวทำงาน Task หนักๆ เช่น import scan)
+  celeryworker:
+    image: defectdojo/defectdojo-django:latest
+    container_name: defectdojo_celeryworker
+    env_file: .env
+    command: >
+      celery -A dojo worker
+        -l info
+        -c 2
+        --max-tasks-per-child 10000
+    depends_on:
+      - db
+      - redis
+    restart: always
+    volumes:
+      - defectdojo-media:/app/media
+
+  # 5. UWSGI (Application Server หลักของ Django)
+  uwsgi:
+    image: defectdojo/defectdojo-django:latest
+    container_name: defectdojo_uwsgi
+    env_file: .env
+    command: >
+      bash -c "
+        ./wait-for-it.sh db:${POSTGRES_PORT:-5432} -t 0 --
+        python manage.py makemigrations dojo --noinput &&
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        python manage.py loaddata initial_data &&
+        python manage.py create_admin_user --username ${DD_ADMIN_USERNAME} --password ${DD_ADMIN_PASSWORD} --email ${DD_ADMIN_EMAIL} --no-input || echo 'Admin user already exists.' &&
+        uwsgi --ini uwsgi.ini
+      "
+    depends_on:
+      - db
+      - redis
+    restart: always
+    volumes:
+      - defectdojo-media:/app/media
+
+  # 6. Nginx (Web Server / Reverse Proxy)
+  nginx:
+    image: defectdojo/defectdojo-nginx:latest
+    container_name: defectdojo_nginx
+    ports:
+      - "8080:8080" # แมปพอร์ต 8080 ของโฮสต์ ไปยัง 8080 ของ container
+    depends_on:
+      - uwsgi
+    volumes:
+      - defectdojo-media:/usr/share/nginx/html/media
+    restart: always
+
+# Volumes สำหรับเก็บข้อมูลถาวร
+volumes:
+  defectdojo-db-data:
+  defectdojo-media:
